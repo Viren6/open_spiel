@@ -131,6 +131,7 @@ PlayGame(const open_spiel::Game &game,
     }
   }
 
+  size_t moves_played = history.size();
   while (!state->IsTerminal()) {
     open_spiel::Player player = state->CurrentPlayer();
 
@@ -140,9 +141,18 @@ PlayGame(const open_spiel::Game &game,
       open_spiel::ActionsAndProbs outcomes = state->ChanceOutcomes();
       action = open_spiel::SampleAction(outcomes, rng).first;
     } else {
-      // The state must be a decision node, ask the right bot to make its
-      // action.
-      action = bots[player]->Step(*state);
+      // For the first 10 moves of the game (including any forced initial
+      // actions) pick a random legal action regardless of the bot type to
+      // increase exploration.
+      if (moves_played < 10) {
+        std::vector<open_spiel::Action> legal_actions = state->LegalActions();
+        std::uniform_int_distribution<size_t> dist(0, legal_actions.size() - 1);
+        action = legal_actions[dist(rng)];
+      } else {
+        // The state must be a decision node, ask the right bot to make its
+        // action.
+        action = bots[player]->Step(*state);
+      }
     }
     if (!quiet)
       std::cerr << "Player " << player
@@ -159,6 +169,7 @@ PlayGame(const open_spiel::Game &game,
     // Update history and get the next state.
     history.push_back(state->ActionToString(player, action));
     state->ApplyAction(action);
+    ++moves_played;
 
     if (!quiet)
       std::cerr << "Next state:\n" << state->ToString() << std::endl;
