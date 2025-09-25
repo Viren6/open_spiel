@@ -52,13 +52,17 @@ class VPNetEvaluator : public Evaluator {
   open_spiel::HistogramNumbered BatchSizeHistogram();
 
  private:
+  struct CacheValue {
+    VPNetModel::InferenceInputs inputs;
+    VPNetModel::InferenceOutputs outputs;
+  };
+
   VPNetModel::InferenceOutputs Inference(const State& state);
 
   void Runner();
 
   DeviceManager& device_manager_;
-  std::vector<std::unique_ptr<LRUCache<uint64_t, VPNetModel::InferenceOutputs>>>
-      cache_;
+  std::vector<std::unique_ptr<LRUCache<uint64_t, CacheValue>>> cache_;
   const int batch_size_;
 
   struct QueueItem {

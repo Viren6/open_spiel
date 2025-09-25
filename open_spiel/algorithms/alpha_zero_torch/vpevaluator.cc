@@ -14,8 +14,13 @@
 
 #include "open_spiel/algorithms/alpha_zero_torch/vpevaluator.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <iomanip>
+#include <iostream>
 #include <memory>
+#include <sstream>
+#include <thread>
 
 #include "open_spiel/abseil-cpp/absl/hash/hash.h"
 #include "open_spiel/abseil-cpp/absl/time/time.h"
@@ -24,6 +29,70 @@
 namespace open_spiel {
 namespace algorithms {
 namespace torch_az {
+namespace {
+
+template <typename T>
+std::string FormatVectorPrefix(const std::vector<T>& values, int max_elems) {
+  std::ostringstream oss;
+  oss << std::setprecision(9);
+  oss << "[";
+  const int count = std::min<int>(values.size(), max_elems);
+  for (int i = 0; i < count; ++i) {
+    if (i > 0) {
+      oss << ", ";
+    }
+    oss << values[i];
+  }
+  if (values.size() > static_cast<size_t>(max_elems)) {
+    oss << ", ...";
+  }
+  oss << "]";
+  return oss.str();
+}
+
+template <typename T>
+std::string DescribeVectorDiff(const std::vector<T>& requested,
+                               const std::vector<T>& cached) {
+  std::ostringstream oss;
+  oss << std::setprecision(9);
+  oss << "{requested_size=" << requested.size()
+      << ", cached_size=" << cached.size();
+  const size_t limit = std::min(requested.size(), cached.size());
+  size_t mismatch_index = 0;
+  while (mismatch_index < limit &&
+         requested[mismatch_index] == cached[mismatch_index]) {
+    ++mismatch_index;
+  }
+  if (mismatch_index < limit) {
+    oss << ", first_mismatch_index=" << mismatch_index
+        << ", requested_value=" << requested[mismatch_index]
+        << ", cached_value=" << cached[mismatch_index];
+  } else if (requested.size() != cached.size()) {
+    oss << ", mismatch_due_to_size=true";
+  } else {
+    oss << ", mismatch_not_identified=true";
+  }
+  oss << ", requested_prefix=" << FormatVectorPrefix(requested, 10)
+      << ", cached_prefix=" << FormatVectorPrefix(cached, 10) << "}";
+  return oss.str();
+}
+
+void LogCacheCollision(uint64_t key, int shard,
+                       const VPNetModel::InferenceInputs& requested,
+                       const VPNetModel::InferenceInputs& cached) {
+  std::ostringstream oss;
+  oss << std::setprecision(9);
+  oss << "AlphaZero Torch inference cache collision detected"
+      << " (thread=" << std::this_thread::get_id()
+      << ", shard=" << shard << ", key=" << key << ")";
+  oss << ". Legal actions diff "
+      << DescribeVectorDiff(requested.legal_actions, cached.legal_actions);
+  oss << "; Observation diff "
+      << DescribeVectorDiff(requested.observations, cached.observations);
+  std::cerr << oss.str() << std::endl;
+}
+
+}  // namespace
 
 VPNetEvaluator::VPNetEvaluator(DeviceManager* device_manager, int batch_size,
                                int threads, int cache_size, int cache_shards)
@@ -34,9 +103,8 @@ VPNetEvaluator::VPNetEvaluator(DeviceManager* device_manager, int batch_size,
   cache_shards = std::max(1, cache_shards);
   cache_.reserve(cache_shards);
   for (int i = 0; i < cache_shards; ++i) {
-    cache_.push_back(
-        std::make_unique<LRUCache<uint64_t, VPNetModel::InferenceOutputs>>(
-            cache_size / cache_shards));
+    cache_.push_back(std::make_unique<LRUCache<uint64_t, CacheValue>>(
+        cache_size / cache_shards));
   }
   if (batch_size_ <= 1) {
     threads = 0;
@@ -88,15 +156,18 @@ VPNetModel::InferenceOutputs VPNetEvaluator::Inference(const State& state) {
   VPNetModel::InferenceInputs inputs = {state.LegalActions(),
                                         state.ObservationTensor()};
 
-  uint64_t key;
-  int cache_shard;
+  uint64_t key = 0;
+  int cache_shard = 0;
   if (!cache_.empty()) {
     key = absl::Hash<VPNetModel::InferenceInputs>{}(inputs);
     cache_shard = key % cache_.size();
-    absl::optional<const VPNetModel::InferenceOutputs> opt_outputs =
+    absl::optional<const CacheValue> opt_value =
         cache_[cache_shard]->Get(key);
-    if (opt_outputs) {
-      return *opt_outputs;
+    if (opt_value) {
+      if (opt_value->inputs == inputs) {
+        return opt_value->outputs;
+      }
+      LogCacheCollision(key, cache_shard, inputs, opt_value->inputs);
     }
   }
   VPNetModel::InferenceOutputs outputs;
@@ -109,7 +180,7 @@ VPNetModel::InferenceOutputs VPNetEvaluator::Inference(const State& state) {
     outputs = fut.get();
   }
   if (!cache_.empty()) {
-    cache_[cache_shard]->Set(key, outputs);
+    cache_[cache_shard]->Set(key, CacheValue{inputs, outputs});
   }
   return outputs;
 }
