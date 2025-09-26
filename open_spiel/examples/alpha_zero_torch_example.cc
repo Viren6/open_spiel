@@ -45,6 +45,22 @@ ABSL_FLAG(double, cutoff_probability, 0.8,
            "probability."));
 ABSL_FLAG(double, cutoff_value, 0.95,
           "Cut off rollouts early when above this value.");
+ABSL_FLAG(double, p_full, 0.25,
+          "Probability that a decision uses the full PCR search cap.");
+ABSL_FLAG(int, full_search_simulations, 600,
+          "Initial max simulations for full PCR searches.");
+ABSL_FLAG(int, full_search_simulations_final, 1000,
+          "Final max simulations for full PCR searches.");
+ABSL_FLAG(int, fast_search_simulations, 100,
+          "Initial max simulations for fast PCR searches.");
+ABSL_FLAG(int, fast_search_simulations_final, 200,
+          "Final max simulations for fast PCR searches.");
+ABSL_FLAG(int, playout_cap_anneal_steps, 0,
+          "Number of learner steps to anneal PCR caps over (0 disables).");
+ABSL_FLAG(bool, record_policy_only_when_full, true,
+          "Whether only full-search turns contribute policy targets.");
+ABSL_FLAG(bool, disable_noise_on_fast, true,
+          "Disable exploration noise on fast PCR searches.");
 ABSL_FLAG(double, learning_rate, 0.0001, "Learning rate.");
 ABSL_FLAG(double, weight_decay, 0.0001, "Weight decay.");
 ABSL_FLAG(double, policy_alpha, 1, "What dirichlet noise alpha to use.");
@@ -156,6 +172,21 @@ int main(int argc, char** argv) {
     config.temperature_drop = absl::GetFlag(FLAGS_temperature_drop);
     config.cutoff_probability = absl::GetFlag(FLAGS_cutoff_probability);
     config.cutoff_value = absl::GetFlag(FLAGS_cutoff_value);
+    config.p_full = absl::GetFlag(FLAGS_p_full);
+    config.full_search_simulations =
+        absl::GetFlag(FLAGS_full_search_simulations);
+    config.full_search_simulations_final =
+        absl::GetFlag(FLAGS_full_search_simulations_final);
+    config.fast_search_simulations =
+        absl::GetFlag(FLAGS_fast_search_simulations);
+    config.fast_search_simulations_final =
+        absl::GetFlag(FLAGS_fast_search_simulations_final);
+    config.playout_cap_anneal_steps =
+        absl::GetFlag(FLAGS_playout_cap_anneal_steps);
+    config.record_policy_only_when_full =
+        absl::GetFlag(FLAGS_record_policy_only_when_full);
+    config.disable_noise_on_fast =
+        absl::GetFlag(FLAGS_disable_noise_on_fast);
     config.actors = absl::GetFlag(FLAGS_actors);
     config.evaluators = absl::GetFlag(FLAGS_evaluators);
     config.eval_levels = absl::GetFlag(FLAGS_eval_levels);

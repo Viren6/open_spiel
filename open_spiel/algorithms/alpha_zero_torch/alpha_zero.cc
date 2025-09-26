@@ -15,6 +15,7 @@
 #include "open_spiel/algorithms/alpha_zero_torch/alpha_zero.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -40,6 +41,7 @@
 #include "open_spiel/algorithms/alpha_zero_torch/vpevaluator.h"
 #include "open_spiel/algorithms/alpha_zero_torch/vpnet.h"
 #include "open_spiel/algorithms/mcts.h"
+#include "open_spiel/games/kuhn_poker/kuhn_poker.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 #include "open_spiel/utils/circular_buffer.h"
@@ -62,6 +64,10 @@ struct StartInfo {
   int start_step;
   int model_checkpoint_step;
   int64_t total_trajectories;
+};
+
+struct SharedTrainingState {
+  std::atomic<int> learner_step{0};
 };
 
 StartInfo StartInfoFromLearnerJson(const std::string& path) {
@@ -92,6 +98,56 @@ StartInfo StartInfoFromLearnerJson(const std::string& path) {
   return start_info;
 }
 
+namespace {
+
+double PCRAnnealProgress(const AlphaZeroConfig& config,
+                         const SharedTrainingState* shared_state) {
+  if (config.playout_cap_anneal_steps <= 0 || shared_state == nullptr) {
+    return 1.0;
+  }
+  int step = shared_state->learner_step.load(std::memory_order_acquire);
+  if (step <= 0) {
+    return 0.0;
+  }
+  double progress = static_cast<double>(step) /
+                    static_cast<double>(config.playout_cap_anneal_steps);
+  return std::min(1.0, std::max(0.0, progress));
+}
+
+int InterpolateCap(int start, int final, double progress) {
+  double interpolated = static_cast<double>(start) +
+                        (static_cast<double>(final - start) * progress);
+  return std::max(1, static_cast<int>(std::round(interpolated)));
+}
+
+double KuhnPokerMultiplier(const open_spiel::Game& game,
+                           const open_spiel::State& state) {
+  if (game.GetType().short_name != "kuhn_poker") {
+    return 1.0;
+  }
+  const std::vector<open_spiel::Action>& history = state.History();
+  const int num_players = game.NumPlayers();
+  if (history.size() <= num_players) {
+    return 1.2;
+  }
+  bool bet_seen = false;
+  for (int i = num_players; i < history.size(); ++i) {
+    if (history[i] == kuhn_poker::ActionType::kBet) {
+      bet_seen = true;
+      break;
+    }
+  }
+  if (!bet_seen && history.size() <= num_players + 1) {
+    return 1.2;
+  }
+  if (bet_seen) {
+    return 0.7;
+  }
+  return 1.0;
+}
+
+}  // namespace
+
 struct Trajectory {
   struct State {
     std::vector<float> observation;
@@ -100,6 +156,7 @@ struct Trajectory {
     open_spiel::Action action;
     open_spiel::ActionsAndProbs policy;
     double value;
+    double policy_weight;
   };
 
   std::vector<State> states;
@@ -109,10 +166,13 @@ struct Trajectory {
 Trajectory PlayGame(Logger* logger, int game_num, const open_spiel::Game& game,
                     std::vector<std::unique_ptr<MCTSBot>>* bots,
                     std::mt19937* rng, double temperature, int temperature_drop,
-                    double cutoff_value, bool verbose = false) {
+                    double cutoff_value, const AlphaZeroConfig& config,
+                    const SharedTrainingState* shared_state, bool use_pcr,
+                    bool verbose = false) {
   std::unique_ptr<open_spiel::State> state = game.NewInitialState();
   std::vector<std::string> history;
   Trajectory trajectory;
+  absl::uniform_real_distribution<double> pcr_dist(0.0, 1.0);
 
   while (true) {
     if (state->IsChanceNode()) {
@@ -123,7 +183,38 @@ Trajectory PlayGame(Logger* logger, int game_num, const open_spiel::Game& game,
       state->ApplyAction(action);
     } else {
       open_spiel::Player player = state->CurrentPlayer();
-      std::unique_ptr<SearchNode> root = (*bots)[player]->MCTSearch(*state);
+      double policy_weight = 1.0;
+      MCTSBot* bot = (*bots)[player].get();
+      if (use_pcr) {
+        double progress = PCRAnnealProgress(config, shared_state);
+        int full_cap = InterpolateCap(config.full_search_simulations,
+                                      config.full_search_simulations_final,
+                                      progress);
+        int fast_cap = InterpolateCap(config.fast_search_simulations,
+                                      config.fast_search_simulations_final,
+                                      progress);
+        bool force_full = config.p_full >= 1.0;
+        bool force_fast = config.p_full <= 0.0;
+        bool full_search = force_full ||
+                           (!force_fast && pcr_dist(*rng) < config.p_full);
+        if (force_fast) {
+          full_search = false;
+        }
+        int target_cap = full_search ? full_cap : fast_cap;
+        double multiplier = KuhnPokerMultiplier(game, *state);
+        target_cap = std::max(
+            1, static_cast<int>(std::round(target_cap * multiplier)));
+        bot->SetMaxSimulations(target_cap);
+        double epsilon = config.policy_epsilon;
+        if (!full_search && config.disable_noise_on_fast) {
+          epsilon = 0.0;
+        }
+        bot->SetDirichletNoise(config.policy_alpha, epsilon);
+        policy_weight = config.record_policy_only_when_full
+                            ? (full_search ? 1.0 : 0.0)
+                            : 1.0;
+      }
+      std::unique_ptr<SearchNode> root = bot->MCTSearch(*state);
       open_spiel::ActionsAndProbs policy;
       policy.reserve(root->children.size());
       for (const SearchNode& c : root->children) {
@@ -141,7 +232,7 @@ Trajectory PlayGame(Logger* logger, int game_num, const open_spiel::Game& game,
       double root_value = root->total_reward / root->explore_count;
       trajectory.states.push_back(Trajectory::State{
           state->ObservationTensor(), player, state->LegalActions(), action,
-          std::move(policy), root_value});
+          std::move(policy), root_value, policy_weight});
       std::string action_str = state->ActionToString(player, action);
       history.push_back(action_str);
       state->ApplyAction(action);
@@ -184,7 +275,8 @@ std::unique_ptr<MCTSBot> InitAZBot(const AlphaZeroConfig& config,
 // An actor thread runner that generates games and returns trajectories.
 void actor(const open_spiel::Game& game, const AlphaZeroConfig& config, int num,
            ThreadedQueue<Trajectory>* trajectory_queue,
-           std::shared_ptr<VPNetEvaluator> vp_eval, StopToken* stop) {
+           std::shared_ptr<VPNetEvaluator> vp_eval, StopToken* stop,
+           const SharedTrainingState* shared_state) {
   std::unique_ptr<Logger> logger;
   if (num < 20) {  // Limit the number of open files.
     logger.reset(new FileLogger(config.path, absl::StrCat("actor-", num)));
@@ -204,7 +296,8 @@ void actor(const open_spiel::Game& game, const AlphaZeroConfig& config, int num,
                                                : game.MaxUtility() + 1);
     if (!trajectory_queue->Push(
             PlayGame(logger.get(), game_num, game, &bots, &rng,
-                     config.temperature, config.temperature_drop, cutoff),
+                     config.temperature, config.temperature_drop, cutoff,
+                     config, shared_state, /*use_pcr=*/true),
             absl::Seconds(10))) {
       logger->Print("Failed to push a trajectory after 10 seconds.");
     }
@@ -290,7 +383,8 @@ void evaluator(const open_spiel::Game& game, const AlphaZeroConfig& config,
     logger.Print("Running MCTS with %d simulations", rand_max_simulations);
     Trajectory trajectory = PlayGame(
         &logger, game_num, game, &bots, &rng, /*temperature=*/1,
-        /*temperature_drop=*/0, /*cutoff_value=*/game.MaxUtility() + 1);
+        /*temperature_drop=*/0, /*cutoff_value=*/game.MaxUtility() + 1, config,
+        /*shared_state=*/nullptr, /*use_pcr=*/false);
 
     results->Add(difficulty, trajectory.returns[az_player]);
     logger.Print("Game %d: AZ: %5.2f, MCTS: %5.2f, MCTS-sims: %d, length: %d",
@@ -306,7 +400,8 @@ void learner(const open_spiel::Game& game, const AlphaZeroConfig& config,
              std::shared_ptr<VPNetEvaluator> eval,
              ThreadedQueue<Trajectory>* trajectory_queue,
              EvalResults* eval_results, StopToken* stop,
-             const StartInfo& start_info) {
+             const StartInfo& start_info,
+             SharedTrainingState* shared_state) {
   FileLogger logger(config.path, "learner", "a");
   DataLoggerJsonLines data_logger(
       config.path, "learner", true, "a", start_info.start_time);
@@ -338,6 +433,9 @@ void learner(const open_spiel::Game& game, const AlphaZeroConfig& config,
        !stop->StopRequested() &&
            (config.max_steps == 0 || step <= config.max_steps);
        ++step) {
+    if (shared_state != nullptr) {
+      shared_state->learner_step.store(step, std::memory_order_release);
+    }
     outcomes.Reset();
     game_lengths.Reset();
     game_lengths_hist.Reset();
@@ -364,9 +462,9 @@ void learner(const open_spiel::Game& game, const AlphaZeroConfig& config,
         outcomes.Add(p1_outcome > 0 ? 0 : (p1_outcome < 0 ? 1 : 2));
 
         for (const Trajectory::State& state : trajectory->states) {
-          replay_buffer.Add(VPNetModel::TrainInputs{state.legal_actions,
-                                                    state.observation,
-                                                    state.policy, p1_outcome});
+          replay_buffer.Add(VPNetModel::TrainInputs{
+              state.legal_actions, state.observation, state.policy,
+              p1_outcome, state.policy_weight});
           num_states += 1;
         }
 
@@ -603,11 +701,18 @@ bool AlphaZero(AlphaZeroConfig config, StopToken* stop, bool resuming) {
 
   EvalResults eval_results(config.eval_levels, config.evaluation_window);
 
+  auto shared_state = std::make_shared<SharedTrainingState>();
+  shared_state->learner_step.store(start_info.start_step,
+                                   std::memory_order_release);
+
   std::vector<Thread> actors;
   actors.reserve(config.actors);
   for (int i = 0; i < config.actors; ++i) {
     actors.emplace_back(
-        [&, i]() { actor(*game, config, i, &trajectory_queue, eval, stop); });
+        [&, i, shared_state]() {
+          actor(*game, config, i, &trajectory_queue, eval, stop,
+                shared_state.get());
+        });
   }
   std::vector<Thread> evaluators;
   evaluators.reserve(config.evaluators);
@@ -616,7 +721,7 @@ bool AlphaZero(AlphaZeroConfig config, StopToken* stop, bool resuming) {
         [&, i]() { evaluator(*game, config, i, &eval_results, eval, stop); });
   }
   learner(*game, config, &device_manager, eval, &trajectory_queue,
-          &eval_results, stop, start_info);
+          &eval_results, stop, start_info, shared_state.get());
 
   if (!stop->StopRequested()) {
     stop->Stop();

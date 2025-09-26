@@ -338,7 +338,8 @@ std::vector<torch::Tensor> ModelImpl::forward(torch::Tensor x,
 std::vector<torch::Tensor> ModelImpl::losses(torch::Tensor inputs,
                                              torch::Tensor masks,
                                              torch::Tensor policy_targets,
-                                             torch::Tensor value_targets) {
+                                             torch::Tensor value_targets,
+                                             torch::Tensor policy_weights) {
   std::vector<torch::Tensor> output = this->forward_(inputs, masks);
 
   torch::Tensor value_predictions = output[0];
@@ -347,7 +348,15 @@ std::vector<torch::Tensor> ModelImpl::losses(torch::Tensor inputs,
   // Policy loss (cross-entropy).
   torch::Tensor policy_loss = torch::sum(
       -policy_targets * torch::log_softmax(policy_predictions, 1), -1);
-  policy_loss = torch::mean(policy_loss);
+  policy_loss = policy_loss * policy_weights;
+  torch::Tensor weight_sum = policy_weights.sum();
+  if (weight_sum.item<double>() > 0) {
+    policy_loss = policy_loss.sum() / weight_sum;
+  } else {
+    policy_loss = torch::zeros(
+        {},
+        torch::TensorOptions().dtype(torch::kFloat32).device(device_));
+  }
 
   // Value loss (mean-squared error).
   torch::nn::MSELoss mse_loss;

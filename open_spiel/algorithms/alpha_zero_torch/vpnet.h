@@ -97,8 +97,10 @@ class VPNetModel {
     std::vector<float> observations;
     ActionsAndProbs policy;
     double value;
+    double policy_weight = 1.0;
 
-    NOP_STRUCTURE(TrainInputs, legal_actions, observations, policy, value);
+    NOP_STRUCTURE(TrainInputs, legal_actions, observations, policy, value,
+                  policy_weight);
   };
 
   enum CheckpointStep {

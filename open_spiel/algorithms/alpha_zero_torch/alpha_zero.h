@@ -57,6 +57,15 @@ struct AlphaZeroConfig {
   double cutoff_probability;
   double cutoff_value;
 
+  double p_full = 0.25;
+  int full_search_simulations = 600;
+  int full_search_simulations_final = 1000;
+  int fast_search_simulations = 100;
+  int fast_search_simulations_final = 200;
+  int playout_cap_anneal_steps = 0;
+  bool record_policy_only_when_full = true;
+  bool disable_noise_on_fast = true;
+
   int actors;
   int evaluators;
   int eval_levels;
@@ -90,6 +99,14 @@ struct AlphaZeroConfig {
         {"temperature_drop", temperature_drop},
         {"cutoff_probability", cutoff_probability},
         {"cutoff_value", cutoff_value},
+        {"p_full", p_full},
+        {"full_search_simulations", full_search_simulations},
+        {"full_search_simulations_final", full_search_simulations_final},
+        {"fast_search_simulations", fast_search_simulations},
+        {"fast_search_simulations_final", fast_search_simulations_final},
+        {"playout_cap_anneal_steps", playout_cap_anneal_steps},
+        {"record_policy_only_when_full", record_policy_only_when_full},
+        {"disable_noise_on_fast", disable_noise_on_fast},
         {"actors", actors},
         {"evaluators", evaluators},
         {"eval_levels", eval_levels},
@@ -124,6 +141,45 @@ struct AlphaZeroConfig {
     temperature_drop = config_json.at("temperature_drop").GetDouble();
     cutoff_probability = config_json.at("cutoff_probability").GetDouble();
     cutoff_value = config_json.at("cutoff_value").GetDouble();
+    auto find_double = [&config_json](const std::string& key,
+                                      double default_value) {
+      auto it = config_json.find(key);
+      if (it == config_json.end()) return default_value;
+      const json::Value& value = it->second;
+      if (value.IsDouble()) return value.GetDouble();
+      if (value.IsInt()) return static_cast<double>(value.GetInt());
+      return default_value;
+    };
+    auto find_int = [&config_json](const std::string& key, int default_value) {
+      auto it = config_json.find(key);
+      if (it == config_json.end()) return default_value;
+      const json::Value& value = it->second;
+      if (value.IsInt()) return static_cast<int>(value.GetInt());
+      if (value.IsDouble()) return static_cast<int>(value.GetDouble());
+      return default_value;
+    };
+    auto find_bool = [&config_json](const std::string& key, bool default_value) {
+      auto it = config_json.find(key);
+      if (it == config_json.end()) return default_value;
+      const json::Value& value = it->second;
+      if (value.IsBool()) return value.GetBool();
+      return default_value;
+    };
+    p_full = find_double("p_full", p_full);
+    full_search_simulations =
+        find_int("full_search_simulations", full_search_simulations);
+    full_search_simulations_final = find_int(
+        "full_search_simulations_final", full_search_simulations_final);
+    fast_search_simulations =
+        find_int("fast_search_simulations", fast_search_simulations);
+    fast_search_simulations_final = find_int(
+        "fast_search_simulations_final", fast_search_simulations_final);
+    playout_cap_anneal_steps =
+        find_int("playout_cap_anneal_steps", playout_cap_anneal_steps);
+    record_policy_only_when_full = find_bool(
+        "record_policy_only_when_full", record_policy_only_when_full);
+    disable_noise_on_fast =
+        find_bool("disable_noise_on_fast", disable_noise_on_fast);
     actors = config_json.at("actors").GetInt();
     evaluators = config_json.at("evaluators").GetInt();
     eval_levels = config_json.at("eval_levels").GetInt();

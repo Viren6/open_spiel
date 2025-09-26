@@ -213,6 +213,8 @@ VPNetModel::LossInfo VPNetModel::Learn(const std::vector<TrainInputs>& inputs) {
       torch::zeros({training_batch_size, num_actions_}, torch_device_);
   torch::Tensor torch_value_targets =
       torch::empty({training_batch_size, 1}, torch_device_);
+  torch::Tensor torch_policy_weights =
+      torch::empty({training_batch_size}, torch_device_);
 
   for (int batch = 0; batch < training_batch_size; ++batch) {
     // Copy the legal mask(s) to a Torch tensor.
@@ -232,6 +234,8 @@ VPNetModel::LossInfo VPNetModel::Learn(const std::vector<TrainInputs>& inputs) {
 
     // Copy the value target(s) to a Torch tensor.
     torch_value_targets[batch][0] = inputs[batch].value;
+
+    torch_policy_weights[batch] = inputs[batch].policy_weight;
   }
 
   // Run a training step and get the losses.
@@ -240,7 +244,8 @@ VPNetModel::LossInfo VPNetModel::Learn(const std::vector<TrainInputs>& inputs) {
 
   std::vector<torch::Tensor> torch_outputs =
       model_->losses(torch_train_inputs, torch_train_legal_mask,
-                     torch_policy_targets, torch_value_targets);
+                     torch_policy_targets, torch_value_targets,
+                     torch_policy_weights);
 
   torch::Tensor total_loss =
       torch_outputs[0] + torch_outputs[1] + torch_outputs[2];

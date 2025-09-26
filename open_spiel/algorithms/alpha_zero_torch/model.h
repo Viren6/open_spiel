@@ -187,7 +187,8 @@ class ModelImpl : public torch::nn::Module {
   std::vector<torch::Tensor> forward(torch::Tensor x, torch::Tensor mask);
   std::vector<torch::Tensor> losses(torch::Tensor inputs, torch::Tensor masks,
                                     torch::Tensor policy_targets,
-                                    torch::Tensor value_targets);
+                                    torch::Tensor value_targets,
+                                    torch::Tensor policy_weights);
 
  private:
   std::vector<torch::Tensor> forward_(torch::Tensor x, torch::Tensor mask);

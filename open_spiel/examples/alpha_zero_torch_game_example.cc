@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include <array>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -30,6 +31,7 @@
 #include "open_spiel/algorithms/alpha_zero_torch/vpnet.h"
 #include "open_spiel/algorithms/mcts.h"
 #include "open_spiel/bots/human/human_bot.h"
+#include "open_spiel/games/kuhn_poker/kuhn_poker.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
 
@@ -54,11 +56,108 @@ ABSL_FLAG(bool, solve, true, "Whether to use MCTS-Solver.");
 ABSL_FLAG(uint_fast32_t, seed, 0, "Seed for MCTS.");
 ABSL_FLAG(bool, verbose, false, "Show the MCTS stats of possible moves.");
 ABSL_FLAG(bool, quiet, false, "Show the MCTS stats of possible moves.");
+ABSL_FLAG(bool, az_use_pcr, false,
+          "Use playout cap randomization for the AlphaZero player.");
+ABSL_FLAG(double, az_p_full, 0.25,
+          "Probability that AZ uses the full PCR search cap.");
+ABSL_FLAG(int, az_full_simulations, 1000,
+          "Max simulations for full PCR searches when using PCR.");
+ABSL_FLAG(int, az_fast_simulations, 200,
+          "Max simulations for fast PCR searches when using PCR.");
+ABSL_FLAG(bool, az_disable_noise_on_fast, true,
+          "Disable exploration noise on fast PCR searches.");
 
 uint_fast32_t Seed() {
   uint_fast32_t seed = absl::GetFlag(FLAGS_seed);
   return seed != 0 ? seed : absl::ToUnixMicros(absl::Now());
 }
+
+namespace {
+
+double KuhnPokerMultiplier(const open_spiel::Game& game,
+                           const open_spiel::State& state) {
+  if (game.GetType().short_name != "kuhn_poker") {
+    return 1.0;
+  }
+  const std::vector<open_spiel::Action>& history = state.History();
+  const int num_players = game.NumPlayers();
+  if (history.size() <= num_players) {
+    return 1.2;
+  }
+  bool bet_seen = false;
+  for (int i = num_players; i < history.size(); ++i) {
+    if (history[i] == open_spiel::kuhn_poker::ActionType::kBet) {
+      bet_seen = true;
+      break;
+    }
+  }
+  if (!bet_seen && history.size() <= num_players + 1) {
+    return 1.2;
+  }
+  if (bet_seen) {
+    return 0.7;
+  }
+  return 1.0;
+}
+
+class PCRMCTSBot : public open_spiel::algorithms::MCTSBot {
+ public:
+  PCRMCTSBot(const open_spiel::Game& game,
+             std::shared_ptr<open_spiel::algorithms::Evaluator> evaluator,
+             double uct_c, int full_simulations, int fast_simulations,
+             int64_t max_memory_mb, bool solve, int seed, bool verbose,
+             double policy_alpha, double policy_epsilon, double p_full,
+             bool disable_noise_on_fast)
+      : open_spiel::algorithms::MCTSBot(
+            game, std::move(evaluator), uct_c, full_simulations,
+            max_memory_mb, solve, seed, verbose,
+            open_spiel::algorithms::ChildSelectionPolicy::PUCT,
+            policy_alpha, policy_epsilon,
+            /*dont_return_chance_node=*/true),
+        game_(game),
+        p_full_(p_full),
+        full_simulations_(std::max(1, full_simulations)),
+        fast_simulations_(std::max(1, fast_simulations)),
+        disable_noise_on_fast_(disable_noise_on_fast),
+        policy_alpha_(policy_alpha),
+        policy_epsilon_(policy_epsilon),
+        rng_(seed) {}
+
+  open_spiel::Action Step(const open_spiel::State& state) override {
+    bool force_full = p_full_ >= 1.0;
+    bool force_fast = p_full_ <= 0.0;
+    bool full_search = force_full ||
+                       (!force_fast && dist_(rng_) < p_full_);
+    if (force_fast) {
+      full_search = false;
+    }
+    double multiplier = KuhnPokerMultiplier(game_, state);
+    int full_cap = std::max(
+        1, static_cast<int>(std::round(full_simulations_ * multiplier)));
+    int fast_cap = std::max(
+        1, static_cast<int>(std::round(fast_simulations_ * multiplier)));
+    SetMaxSimulations(full_search ? full_cap : fast_cap);
+    double epsilon = policy_epsilon_;
+    if (!full_search && disable_noise_on_fast_) {
+      epsilon = 0.0;
+    }
+    SetDirichletNoise(policy_alpha_, epsilon);
+    return open_spiel::algorithms::MCTSBot::Step(state);
+  }
+
+ private:
+  const open_spiel::Game& game_;
+  double p_full_;
+  int full_simulations_;
+  int fast_simulations_;
+  bool disable_noise_on_fast_;
+  double policy_alpha_;
+  double policy_epsilon_;
+  std::mt19937 rng_;
+  absl::uniform_real_distribution<double> dist_{0.0, 1.0};
+};
+
+}  // namespace
 
 std::unique_ptr<open_spiel::Bot>
 InitBot(std::string type, const open_spiel::Game &game,
@@ -67,6 +166,17 @@ InitBot(std::string type, const open_spiel::Game &game,
         std::shared_ptr<open_spiel::algorithms::torch_az::VPNetEvaluator>
             az_evaluator) {
   if (type == "az") {
+    if (absl::GetFlag(FLAGS_az_use_pcr)) {
+      return std::make_unique<PCRMCTSBot>(
+          game, std::move(az_evaluator), absl::GetFlag(FLAGS_uct_c),
+          absl::GetFlag(FLAGS_az_full_simulations),
+          absl::GetFlag(FLAGS_az_fast_simulations),
+          absl::GetFlag(FLAGS_max_memory_mb), absl::GetFlag(FLAGS_solve),
+          Seed(), absl::GetFlag(FLAGS_verbose),
+          /*policy_alpha=*/0.0, /*policy_epsilon=*/0.0,
+          absl::GetFlag(FLAGS_az_p_full),
+          absl::GetFlag(FLAGS_az_disable_noise_on_fast));
+    }
     return std::make_unique<open_spiel::algorithms::MCTSBot>(
         game, std::move(az_evaluator), absl::GetFlag(FLAGS_uct_c),
         absl::GetFlag(FLAGS_max_simulations),

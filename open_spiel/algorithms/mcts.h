@@ -183,6 +183,13 @@ class MCTSBot : public Bot {
   // Run MCTS on a given state, and return the resulting search tree.
   std::unique_ptr<SearchNode> MCTSearch(const State& state);
 
+  void SetMaxSimulations(int max_simulations) { max_simulations_ = max_simulations; }
+
+  void SetDirichletNoise(double alpha, double epsilon) {
+    dirichlet_alpha_ = alpha;
+    dirichlet_epsilon_ = epsilon;
+  }
+
  private:
   // Applies the UCT policy to play the game until reaching a leaf node.
   //
