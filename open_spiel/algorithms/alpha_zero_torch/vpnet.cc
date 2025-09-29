@@ -198,7 +198,22 @@ std::vector<VPNetModel::InferenceOutputs> VPNetModel::Inference(
 }
 
 VPNetModel::LossInfo VPNetModel::Learn(const std::vector<TrainInputs>& inputs) {
-  int training_batch_size = inputs.size();
+  // Batch norm layers in the residual model require at least two elements per
+  // channel when the model is in training mode. Some games (e.g. leduc poker)
+  // can generate fewer than two unique states early in training, meaning the
+  // replay buffer may yield a batch with a single element. This triggered a
+  // crash when the learner attempted to train on that batch. Duplicating the
+  // lone sample keeps the statistics identical (the loss is averaged across the
+  // batch) while providing the minimum amount of data that batch norm expects.
+  const std::vector<TrainInputs>* train_inputs = &inputs;
+  std::vector<TrainInputs> padded_inputs;
+  if (inputs.size() == 1 && model_config_.nn_model == "resnet") {
+    padded_inputs = inputs;
+    padded_inputs.push_back(inputs.front());
+    train_inputs = &padded_inputs;
+  }
+
+  int training_batch_size = train_inputs->size();
 
   // Torch tensors by default use a dense, row-aligned memory layout.
   //   - Their default data type is a 32-bit float
@@ -216,22 +231,22 @@ VPNetModel::LossInfo VPNetModel::Learn(const std::vector<TrainInputs>& inputs) {
 
   for (int batch = 0; batch < training_batch_size; ++batch) {
     // Copy the legal mask(s) to a Torch tensor.
-    for (Action action : inputs[batch].legal_actions) {
+    for (Action action : (*train_inputs)[batch].legal_actions) {
       torch_train_legal_mask[batch][action] = true;
     }
 
     // Copy the observation(s) to a Torch tensor.
-    for (int i = 0; i < inputs[batch].observations.size(); ++i) {
-      torch_train_inputs[batch][i] = inputs[batch].observations[i];
+    for (int i = 0; i < (*train_inputs)[batch].observations.size(); ++i) {
+      torch_train_inputs[batch][i] = (*train_inputs)[batch].observations[i];
     }
 
     // Copy the policy target(s) to a Torch tensor.
-    for (const auto& [action, probability] : inputs[batch].policy) {
+    for (const auto& [action, probability] : (*train_inputs)[batch].policy) {
       torch_policy_targets[batch][action] = probability;
     }
 
     // Copy the value target(s) to a Torch tensor.
-    torch_value_targets[batch][0] = inputs[batch].value;
+    torch_value_targets[batch][0] = (*train_inputs)[batch].value;
   }
 
   // Run a training step and get the losses.

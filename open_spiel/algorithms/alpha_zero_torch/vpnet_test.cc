@@ -123,6 +123,37 @@ void TestModelCreation(const std::string& nn_model) {
   model.Learn(train_inputs);
 }
 
+void TestResnetHandlesSingletonBatches() {
+  std::cout << "TestResnetHandlesSingletonBatches" << std::endl;
+  std::shared_ptr<const Game> game = LoadGame("leduc_poker");
+  std::string tmp_dir = open_spiel::file::GetTmpDir();
+  std::string filename = "open_spiel_vpnet_test_leduc.pb";
+  SPIEL_CHECK_TRUE(CreateGraphDef(*game,
+                                  /*learning_rate=*/0.01,
+                                  /*weight_decay=*/0.0001, tmp_dir, filename,
+                                  /*nn_model=*/"resnet",
+                                  /*nn_width=*/64,
+                                  /*nn_depth=*/2,
+                                  /*verbose=*/true));
+
+  VPNetModel model(*game, tmp_dir, filename, "/cpu:0");
+
+  std::unique_ptr<open_spiel::State> state = game->NewInitialState();
+  while (state->IsChanceNode()) {
+    open_spiel::Action action = state->ChanceOutcomes()[0].first;
+    state->ApplyAction(action);
+  }
+
+  std::vector<Action> legal_actions = state->LegalActions();
+  std::vector<float> obs = state->ObservationTensor();
+  ActionsAndProbs policy({{legal_actions[0], 1}});
+  std::vector<VPNetModel::TrainInputs> train_inputs;
+  train_inputs.emplace_back(
+      VPNetModel::TrainInputs{legal_actions, obs, policy, /*value=*/0});
+
+  model.Learn(train_inputs);
+}
+
 // Can learn a single trajectory
 void TestModelLearnsSimple(const std::string& nn_model) {
   std::cout << "TestModelLearnsSimple: " << nn_model << std::endl;
@@ -204,6 +235,7 @@ void TestModelLearnsOptimal(
 int main(int argc, char** argv) {
   open_spiel::Init("", &argc, &argv, true);
   open_spiel::algorithms::torch_az::TestModelCreation("resnet");
+  open_spiel::algorithms::torch_az::TestResnetHandlesSingletonBatches();
 
   // Tests below here reuse the graphs created above. Graph creation is slow
   // due to calling a separate python process.
