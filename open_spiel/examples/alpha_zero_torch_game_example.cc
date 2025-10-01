@@ -25,6 +25,7 @@
 #include "open_spiel/abseil-cpp/absl/strings/str_join.h"
 #include "open_spiel/abseil-cpp/absl/time/clock.h"
 #include "open_spiel/abseil-cpp/absl/time/time.h"
+#include "open_spiel/algorithms/alpha_zero_torch/alpha_zero.h"
 #include "open_spiel/algorithms/alpha_zero_torch/device_manager.h"
 #include "open_spiel/algorithms/alpha_zero_torch/vpevaluator.h"
 #include "open_spiel/algorithms/alpha_zero_torch/vpnet.h"
@@ -32,6 +33,9 @@
 #include "open_spiel/bots/human/human_bot.h"
 #include "open_spiel/spiel.h"
 #include "open_spiel/spiel_utils.h"
+#include "open_spiel/utils/file.h"
+#include "open_spiel/utils/json.h"
+#include "open_spiel/abseil-cpp/absl/types/optional.h"
 
 ABSL_FLAG(std::string, game, "tic_tac_toe", "The name of the game to play.");
 ABSL_FLAG(std::string, player1, "az", "Who controls player1.");
@@ -60,20 +64,52 @@ uint_fast32_t Seed() {
   return seed != 0 ? seed : absl::ToUnixMicros(absl::Now());
 }
 
+absl::optional<open_spiel::algorithms::torch_az::AlphaZeroConfig>
+LoadAlphaZeroConfig(const std::string& path) {
+  std::string config_path = absl::StrCat(path, "/config.json");
+  if (!open_spiel::file::Exists(config_path)) {
+    return absl::nullopt;
+  }
+  open_spiel::file::File config_file(config_path, "r");
+  std::string contents = config_file.ReadContents();
+  auto json_value = open_spiel::json::FromString(contents);
+  if (!json_value || !json_value->IsObject()) {
+    return absl::nullopt;
+  }
+  open_spiel::algorithms::torch_az::AlphaZeroConfig config;
+  config.FromJson(json_value->GetObject());
+  return config;
+}
+
 std::unique_ptr<open_spiel::Bot>
 InitBot(std::string type, const open_spiel::Game &game,
         open_spiel::Player player,
         std::shared_ptr<open_spiel::algorithms::Evaluator> evaluator,
         std::shared_ptr<open_spiel::algorithms::torch_az::VPNetEvaluator>
-            az_evaluator) {
+            az_evaluator,
+        const open_spiel::algorithms::torch_az::AlphaZeroConfig* az_config) {
   if (type == "az") {
-    return std::make_unique<open_spiel::algorithms::MCTSBot>(
+    auto bot = std::make_unique<open_spiel::algorithms::MCTSBot>(
         game, std::move(az_evaluator), absl::GetFlag(FLAGS_uct_c),
         absl::GetFlag(FLAGS_max_simulations),
         absl::GetFlag(FLAGS_max_memory_mb), absl::GetFlag(FLAGS_solve), Seed(),
         absl::GetFlag(FLAGS_verbose),
         open_spiel::algorithms::ChildSelectionPolicy::PUCT, 0, 0,
         /*dont_return_chance_node=*/true);
+    if (az_config != nullptr) {
+      if (az_config->policy_use_dynamic_alpha &&
+          az_config->policy_alpha_base > 0) {
+        bot->SetDynamicRootExploration(az_config->policy_alpha_base,
+                                       az_config->policy_alpha_reference);
+      }
+      bot->SetRootPolicyTemperature(az_config->policy_root_temperature);
+      if (az_config->forced_playouts_k > 0) {
+        bot->SetForcedPlayoutConfig(az_config->forced_playouts_k,
+                                    az_config->forced_playouts_gamma);
+        bot->SetPolicyTargetPruning(az_config->policy_target_pruning);
+      }
+    }
+    return bot;
   }
   if (type == "human") {
     return std::make_unique<open_spiel::HumanBot>();
@@ -195,6 +231,8 @@ int main(int argc, char **argv) {
       absl::GetFlag(FLAGS_player2) != "az")
     open_spiel::SpielFatalError("One of the players must be AlphaZero.");
 
+  auto az_config = LoadAlphaZeroConfig(absl::GetFlag(FLAGS_az_path));
+
   open_spiel::algorithms::torch_az::DeviceManager device_manager;
   device_manager.AddDevice(open_spiel::algorithms::torch_az::VPNetModel(
       *game, absl::GetFlag(FLAGS_az_path), absl::GetFlag(FLAGS_az_graph_def),
@@ -213,9 +251,11 @@ int main(int argc, char **argv) {
 
   std::vector<std::unique_ptr<open_spiel::Bot>> bots;
   bots.push_back(
-      InitBot(absl::GetFlag(FLAGS_player1), *game, 0, evaluator, az_evaluator));
+      InitBot(absl::GetFlag(FLAGS_player1), *game, 0, evaluator, az_evaluator,
+              az_config ? &*az_config : nullptr));
   bots.push_back(
-      InitBot(absl::GetFlag(FLAGS_player2), *game, 1, evaluator, az_evaluator));
+      InitBot(absl::GetFlag(FLAGS_player2), *game, 1, evaluator, az_evaluator,
+              az_config ? &*az_config : nullptr));
 
   std::vector<std::string> initial_actions;
   for (int i = 1; i < positional_args.size(); ++i) {

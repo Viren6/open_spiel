@@ -16,6 +16,9 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <numeric>
 
 #include "open_spiel/abseil-cpp/absl/flags/flag.h"
 #include "open_spiel/abseil-cpp/absl/flags/parse.h"
@@ -47,8 +50,23 @@ ABSL_FLAG(double, cutoff_value, 0.95,
           "Cut off rollouts early when above this value.");
 ABSL_FLAG(double, learning_rate, 0.0001, "Learning rate.");
 ABSL_FLAG(double, weight_decay, 0.0001, "Weight decay.");
-ABSL_FLAG(double, policy_alpha, 1, "What dirichlet noise alpha to use.");
+ABSL_FLAG(double, policy_alpha, 0,
+          "Fixed dirichlet noise alpha to use (set <=0 to disable).");
+ABSL_FLAG(double, policy_alpha_base, 0.03,
+          "Base dirichlet alpha used when dynamic scaling is enabled.");
+ABSL_FLAG(double, policy_alpha_reference_actions, 10.0,
+          "Reference number of actions for scaling dirichlet alpha.");
+ABSL_FLAG(bool, use_dynamic_policy_alpha, true,
+          "Enable dynamic dirichlet alpha scaling based on action count.");
 ABSL_FLAG(double, policy_epsilon, 0.25, "What dirichlet noise epsilon to use.");
+ABSL_FLAG(double, policy_root_temperature, 1.05,
+          "Temperature applied to root visits when building policy targets.");
+ABSL_FLAG(double, forced_playouts_k, 2.0,
+          "Multiplier for KataGo-style forced playouts at the root.");
+ABSL_FLAG(double, forced_playouts_gamma, 0.5,
+          "Exponent for KataGo-style forced playout scaling.");
+ABSL_FLAG(bool, policy_target_pruning, true,
+          "Enable policy target pruning for forced playout visits.");
 ABSL_FLAG(int, replay_buffer_size, 1 << 16,
           "How many states to store in the replay buffer.");
 ABSL_FLAG(double, replay_buffer_reuse, 3,
@@ -151,11 +169,23 @@ int main(int argc, char** argv) {
     config.inference_threads = absl::GetFlag(FLAGS_inference_threads);
     config.inference_cache = absl::GetFlag(FLAGS_inference_cache);
     config.policy_alpha = absl::GetFlag(FLAGS_policy_alpha);
+    config.policy_alpha_base = absl::GetFlag(FLAGS_policy_alpha_base);
+    config.policy_alpha_reference =
+        absl::GetFlag(FLAGS_policy_alpha_reference_actions);
+    config.policy_use_dynamic_alpha =
+        absl::GetFlag(FLAGS_use_dynamic_policy_alpha);
     config.policy_epsilon = absl::GetFlag(FLAGS_policy_epsilon);
+    config.policy_root_temperature =
+        absl::GetFlag(FLAGS_policy_root_temperature);
     config.temperature = absl::GetFlag(FLAGS_temperature);
     config.temperature_drop = absl::GetFlag(FLAGS_temperature_drop);
     config.cutoff_probability = absl::GetFlag(FLAGS_cutoff_probability);
     config.cutoff_value = absl::GetFlag(FLAGS_cutoff_value);
+    config.forced_playouts_k = absl::GetFlag(FLAGS_forced_playouts_k);
+    config.forced_playouts_gamma =
+        absl::GetFlag(FLAGS_forced_playouts_gamma);
+    config.policy_target_pruning =
+        absl::GetFlag(FLAGS_policy_target_pruning);
     config.actors = absl::GetFlag(FLAGS_actors);
     config.evaluators = absl::GetFlag(FLAGS_evaluators);
     config.eval_levels = absl::GetFlag(FLAGS_eval_levels);

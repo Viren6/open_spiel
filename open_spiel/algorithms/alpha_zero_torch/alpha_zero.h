@@ -50,12 +50,20 @@ struct AlphaZeroConfig {
 
   double uct_c;
   int max_simulations;
-  double policy_alpha;
+  double policy_alpha = 0;
+  double policy_alpha_base = 0.03;
+  double policy_alpha_reference = 10.0;
+  bool policy_use_dynamic_alpha = true;
   double policy_epsilon;
+  double policy_root_temperature = 1.0;
   double temperature;
   double temperature_drop;
   double cutoff_probability;
   double cutoff_value;
+
+  double forced_playouts_k = 2.0;
+  double forced_playouts_gamma = 0.5;
+  bool policy_target_pruning = true;
 
   int actors;
   int evaluators;
@@ -85,11 +93,18 @@ struct AlphaZeroConfig {
         {"uct_c", uct_c},
         {"max_simulations", max_simulations},
         {"policy_alpha", policy_alpha},
+        {"policy_alpha_base", policy_alpha_base},
+        {"policy_alpha_reference", policy_alpha_reference},
+        {"policy_use_dynamic_alpha", policy_use_dynamic_alpha},
         {"policy_epsilon", policy_epsilon},
+        {"policy_root_temperature", policy_root_temperature},
         {"temperature", temperature},
         {"temperature_drop", temperature_drop},
         {"cutoff_probability", cutoff_probability},
         {"cutoff_value", cutoff_value},
+        {"forced_playouts_k", forced_playouts_k},
+        {"forced_playouts_gamma", forced_playouts_gamma},
+        {"policy_target_pruning", policy_target_pruning},
         {"actors", actors},
         {"evaluators", evaluators},
         {"eval_levels", eval_levels},
@@ -119,11 +134,41 @@ struct AlphaZeroConfig {
     uct_c = config_json.at("uct_c").GetDouble();
     max_simulations = config_json.at("max_simulations").GetInt();
     policy_alpha = config_json.at("policy_alpha").GetDouble();
+    auto policy_alpha_base_it = config_json.find("policy_alpha_base");
+    if (policy_alpha_base_it != config_json.end()) {
+      policy_alpha_base = policy_alpha_base_it->second.GetDouble();
+    }
+    auto policy_alpha_reference_it = config_json.find("policy_alpha_reference");
+    if (policy_alpha_reference_it != config_json.end()) {
+      policy_alpha_reference = policy_alpha_reference_it->second.GetDouble();
+    }
+    auto policy_use_dynamic_alpha_it =
+        config_json.find("policy_use_dynamic_alpha");
+    if (policy_use_dynamic_alpha_it != config_json.end()) {
+      policy_use_dynamic_alpha = policy_use_dynamic_alpha_it->second.GetBool();
+    }
     policy_epsilon = config_json.at("policy_epsilon").GetDouble();
+    auto policy_root_temperature_it =
+        config_json.find("policy_root_temperature");
+    if (policy_root_temperature_it != config_json.end()) {
+      policy_root_temperature = policy_root_temperature_it->second.GetDouble();
+    }
     temperature = config_json.at("temperature").GetDouble();
     temperature_drop = config_json.at("temperature_drop").GetDouble();
     cutoff_probability = config_json.at("cutoff_probability").GetDouble();
     cutoff_value = config_json.at("cutoff_value").GetDouble();
+    auto forced_playouts_k_it = config_json.find("forced_playouts_k");
+    if (forced_playouts_k_it != config_json.end()) {
+      forced_playouts_k = forced_playouts_k_it->second.GetDouble();
+    }
+    auto forced_playouts_gamma_it = config_json.find("forced_playouts_gamma");
+    if (forced_playouts_gamma_it != config_json.end()) {
+      forced_playouts_gamma = forced_playouts_gamma_it->second.GetDouble();
+    }
+    auto policy_target_pruning_it = config_json.find("policy_target_pruning");
+    if (policy_target_pruning_it != config_json.end()) {
+      policy_target_pruning = policy_target_pruning_it->second.GetBool();
+    }
     actors = config_json.at("actors").GetInt();
     evaluators = config_json.at("evaluators").GetInt();
     eval_levels = config_json.at("eval_levels").GetInt();

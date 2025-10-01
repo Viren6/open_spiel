@@ -119,6 +119,8 @@ struct SearchNode {
   double total_reward = 0;      // Total reward passing through this node.
   std::vector<double> outcome;  // The reward if each players plays perfectly.
   std::vector<SearchNode> children;  // The successors to this state.
+  double dirichlet_noise = 0;        // Dirichlet noise sample for this child.
+  int forced_playouts = 0;           // Forced playouts attributed to this child.
 
   SearchNode() {}
 
@@ -183,6 +185,17 @@ class MCTSBot : public Bot {
   // Run MCTS on a given state, and return the resulting search tree.
   std::unique_ptr<SearchNode> MCTSearch(const State& state);
 
+  void SetDynamicRootExploration(double alpha_base,
+                                 double reference_actions);
+  void ClearDynamicRootExploration();
+  void SetRootPolicyTemperature(double temperature);
+  void SetForcedPlayoutConfig(double k, double gamma);
+  void SetPolicyTargetPruning(bool enable);
+  double RootPolicyTemperature() const { return root_policy_temperature_; }
+  double ForcedPlayoutsK() const { return forced_playouts_k_; }
+  double ForcedPlayoutsGamma() const { return forced_playouts_gamma_; }
+  bool PolicyTargetPruningEnabled() const { return policy_target_pruning_; }
+
  private:
   // Applies the UCT policy to play the game until reaching a leaf node.
   //
@@ -216,6 +229,14 @@ class MCTSBot : public Bot {
   std::mt19937 rng_;
   const ChildSelectionPolicy child_selection_policy_;
   std::shared_ptr<Evaluator> evaluator_;
+  bool use_dynamic_dirichlet_ = false;
+  double dirichlet_alpha_base_ = 0.0;
+  double dirichlet_alpha_reference_actions_ = 1.0;
+  double root_policy_temperature_ = 1.0;
+  double forced_playouts_k_ = 0.0;
+  double forced_playouts_gamma_ = 0.5;
+  bool policy_target_pruning_ = false;
+  bool use_forced_playouts_ = false;
 };
 
 // Returns a vector of noise sampled from a dirichlet distribution. See:

@@ -24,6 +24,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <numeric>
 
 #include "open_spiel/abseil-cpp/absl/algorithm/container.h"
 #include "open_spiel/abseil-cpp/absl/random/uniform_real_distribution.h"
@@ -56,6 +57,158 @@
 namespace open_spiel {
 namespace algorithms {
 namespace torch_az {
+
+namespace {
+
+using open_spiel::ActionsAndProbs;
+using open_spiel::algorithms::SearchNode;
+
+double HypotheticalPUCTValue(const SearchNode& child, double parent_count,
+                             double child_count, double uct_c) {
+  if (!child.outcome.empty()) {
+    return child.outcome[child.player];
+  }
+  double average = 0.0;
+  if (child_count > 0) {
+    average = child.total_reward / child_count;
+  }
+  double exploration = 0.0;
+  if (parent_count > 0) {
+    exploration = uct_c * child.prior * std::sqrt(parent_count) /
+                  (child_count + 1.0);
+  }
+  return average + exploration;
+}
+
+std::vector<double> AdjustRootVisitCounts(
+    const SearchNode& root, double forced_playouts_k,
+    double forced_playouts_gamma, bool policy_target_pruning, double uct_c) {
+  std::vector<double> visits;
+  visits.reserve(root.children.size());
+  for (const SearchNode& child : root.children) {
+    visits.push_back(child.explore_count);
+  }
+  double total_visits =
+      std::accumulate(visits.begin(), visits.end(), 0.0);
+  if (!policy_target_pruning || forced_playouts_k <= 0 ||
+      total_visits <= 0 || root.player == open_spiel::kChancePlayerId) {
+    return visits;
+  }
+
+  int best_index = 0;
+  for (int i = 1; i < visits.size(); ++i) {
+    if (visits[i] > visits[best_index]) {
+      best_index = i;
+    }
+  }
+
+  std::vector<double> adjusted = visits;
+  double adjusted_total = total_visits;
+  double forced_scale =
+      std::pow(std::max(1.0, total_visits), forced_playouts_gamma);
+
+  for (int i = 0; i < adjusted.size(); ++i) {
+    if (i == best_index) {
+      continue;
+    }
+    const SearchNode& child = root.children[i];
+    double target =
+        forced_playouts_k * child.dirichlet_noise * forced_scale;
+    int max_remove = std::min<int>(
+        child.forced_playouts,
+        static_cast<int>(std::floor(target + 1e-9)));
+    max_remove = std::min<int>(max_remove, static_cast<int>(adjusted[i]));
+    for (int r = 0; r < max_remove; ++r) {
+      if (adjusted[i] <= 0 || adjusted_total <= 1) {
+        break;
+      }
+      double new_count = adjusted[i] - 1;
+      double new_total = adjusted_total - 1;
+      double child_puct =
+          HypotheticalPUCTValue(child, new_total, new_count, uct_c);
+      const SearchNode& best_child = root.children[best_index];
+      double best_puct = HypotheticalPUCTValue(
+          best_child, new_total, adjusted[best_index], uct_c);
+      if (child_puct >= best_puct) {
+        break;
+      }
+      adjusted[i] = new_count;
+      adjusted_total = new_total;
+    }
+  }
+
+  for (int i = 0; i < adjusted.size(); ++i) {
+    if (i == best_index) {
+      continue;
+    }
+    if (adjusted[i] <= 1.0) {
+      adjusted_total -= adjusted[i];
+      adjusted[i] = 0.0;
+    }
+  }
+
+  return adjusted;
+}
+
+ActionsAndProbs BuildPolicyFromVisits(const SearchNode& root,
+                                      const std::vector<double>& visits,
+                                      double root_temperature) {
+  ActionsAndProbs policy;
+  policy.reserve(root.children.size());
+  double temperature = root_temperature > 0 ? root_temperature : 1.0;
+  double inv_temp = 1.0 / temperature;
+  double sum = 0.0;
+  for (int i = 0; i < visits.size() && i < root.children.size(); ++i) {
+    double count = visits[i];
+    if (count <= 0) {
+      continue;
+    }
+    double weight = inv_temp == 1.0 ? count : std::pow(count, inv_temp);
+    if (!std::isfinite(weight) || weight <= 0) {
+      continue;
+    }
+    policy.emplace_back(root.children[i].action, weight);
+    sum += weight;
+  }
+
+  if (policy.empty() || sum <= 0) {
+    policy.clear();
+    if (!root.children.empty()) {
+      double uniform = 1.0 / static_cast<double>(root.children.size());
+      for (const SearchNode& child : root.children) {
+        policy.emplace_back(child.action, uniform);
+      }
+    }
+    return policy;
+  }
+
+  NormalizePolicy(&policy);
+  return policy;
+}
+
+ActionsAndProbs ApplyTemperatureToPolicy(const ActionsAndProbs& policy,
+                                         double temperature) {
+  if (policy.empty() || temperature <= 0 || temperature == 1.0) {
+    return policy;
+  }
+  double inv_temp = 1.0 / temperature;
+  ActionsAndProbs adjusted;
+  adjusted.reserve(policy.size());
+  double sum = 0.0;
+  for (const auto& [action, prob] : policy) {
+    double clamped = std::max(prob, 1e-12);
+    double weight = std::pow(clamped, inv_temp);
+    adjusted.emplace_back(action, weight);
+    sum += weight;
+  }
+  if (sum <= 0) {
+    return policy;
+  }
+  NormalizePolicy(&adjusted);
+  return adjusted;
+}
+
+}  // namespace
 
 struct StartInfo {
   absl::Time start_time;
@@ -109,7 +262,8 @@ struct Trajectory {
 Trajectory PlayGame(Logger* logger, int game_num, const open_spiel::Game& game,
                     std::vector<std::unique_ptr<MCTSBot>>* bots,
                     std::mt19937* rng, double temperature, int temperature_drop,
-                    double cutoff_value, bool verbose = false) {
+                    double cutoff_value, const AlphaZeroConfig& config,
+                    bool verbose = false) {
   std::unique_ptr<open_spiel::State> state = game.NewInitialState();
   std::vector<std::string> history;
   Trajectory trajectory;
@@ -124,24 +278,29 @@ Trajectory PlayGame(Logger* logger, int game_num, const open_spiel::Game& game,
     } else {
       open_spiel::Player player = state->CurrentPlayer();
       std::unique_ptr<SearchNode> root = (*bots)[player]->MCTSearch(*state);
-      open_spiel::ActionsAndProbs policy;
-      policy.reserve(root->children.size());
-      for (const SearchNode& c : root->children) {
-        policy.emplace_back(c.action,
-                            std::pow(c.explore_count, 1.0 / temperature));
+      std::vector<double> adjusted_visits = AdjustRootVisitCounts(
+          *root, config.forced_playouts_k, config.forced_playouts_gamma,
+          config.policy_target_pruning, config.uct_c);
+      open_spiel::ActionsAndProbs training_policy = BuildPolicyFromVisits(
+          *root, adjusted_visits, config.policy_root_temperature);
+      open_spiel::ActionsAndProbs sampling_policy = training_policy;
+      if (history.size() < temperature_drop) {
+        sampling_policy =
+            ApplyTemperatureToPolicy(training_policy, temperature);
       }
-      NormalizePolicy(&policy);
       open_spiel::Action action;
       if (history.size() >= temperature_drop) {
         action = root->BestChild().action;
+      } else if (!sampling_policy.empty()) {
+        action = open_spiel::SampleAction(sampling_policy, *rng).first;
       } else {
-        action = open_spiel::SampleAction(policy, *rng).first;
+        action = root->BestChild().action;
       }
 
       double root_value = root->total_reward / root->explore_count;
       trajectory.states.push_back(Trajectory::State{
           state->ObservationTensor(), player, state->LegalActions(), action,
-          std::move(policy), root_value});
+          std::move(training_policy), root_value});
       std::string action_str = state->ActionToString(player, action);
       history.push_back(action_str);
       state->ApplyAction(action);
@@ -170,15 +329,37 @@ std::unique_ptr<MCTSBot> InitAZBot(const AlphaZeroConfig& config,
                                    const open_spiel::Game& game,
                                    std::shared_ptr<Evaluator> evaluator,
                                    bool evaluation) {
-  return std::make_unique<MCTSBot>(
+  double dirichlet_alpha =
+      config.policy_use_dynamic_alpha ? 0.0 : config.policy_alpha;
+  auto bot = std::make_unique<MCTSBot>(
       game, std::move(evaluator), config.uct_c, config.max_simulations,
       /*max_memory_mb=*/10,
       /*solve=*/false,
       /*seed=*/0,
       /*verbose=*/false, ChildSelectionPolicy::PUCT,
-      evaluation ? 0 : config.policy_alpha,
+      evaluation ? 0 : dirichlet_alpha,
       evaluation ? 0 : config.policy_epsilon,
       /*dont_return_chance_node*/ true);
+
+  if (config.policy_use_dynamic_alpha && config.policy_alpha_base > 0) {
+    bot->SetDynamicRootExploration(config.policy_alpha_base,
+                                   config.policy_alpha_reference);
+  } else {
+    bot->ClearDynamicRootExploration();
+  }
+
+  if (evaluation) {
+    bot->SetRootPolicyTemperature(1.0);
+    bot->SetForcedPlayoutConfig(0.0, config.forced_playouts_gamma);
+    bot->SetPolicyTargetPruning(false);
+  } else {
+    bot->SetRootPolicyTemperature(config.policy_root_temperature);
+    bot->SetForcedPlayoutConfig(config.forced_playouts_k,
+                                config.forced_playouts_gamma);
+    bot->SetPolicyTargetPruning(config.policy_target_pruning);
+  }
+
+  return bot;
 }
 
 // An actor thread runner that generates games and returns trajectories.
@@ -204,7 +385,8 @@ void actor(const open_spiel::Game& game, const AlphaZeroConfig& config, int num,
                                                : game.MaxUtility() + 1);
     if (!trajectory_queue->Push(
             PlayGame(logger.get(), game_num, game, &bots, &rng,
-                     config.temperature, config.temperature_drop, cutoff),
+                     config.temperature, config.temperature_drop, cutoff,
+                     config),
             absl::Seconds(10))) {
       logger->Print("Failed to push a trajectory after 10 seconds.");
     }
@@ -290,7 +472,8 @@ void evaluator(const open_spiel::Game& game, const AlphaZeroConfig& config,
     logger.Print("Running MCTS with %d simulations", rand_max_simulations);
     Trajectory trajectory = PlayGame(
         &logger, game_num, game, &bots, &rng, /*temperature=*/1,
-        /*temperature_drop=*/0, /*cutoff_value=*/game.MaxUtility() + 1);
+        /*temperature_drop=*/0, /*cutoff_value=*/game.MaxUtility() + 1,
+        config);
 
     results->Add(difficulty, trajectory.returns[az_player]);
     logger.Print("Game %d: AZ: %5.2f, MCTS: %5.2f, MCTS-sims: %d, length: %d",

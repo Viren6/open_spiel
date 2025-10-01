@@ -20,6 +20,7 @@
 #include <memory>
 #include <random>
 #include <vector>
+#include <numeric>
 
 #include "open_spiel/abseil-cpp/absl/algorithm/container.h"
 #include "open_spiel/abseil-cpp/absl/random/distributions.h"
@@ -229,6 +230,30 @@ MCTSBot::MCTSBot(const Game& game, std::shared_ptr<Evaluator> evaluator,
     SpielFatalError("Game must have sequential turns.");
 }
 
+void MCTSBot::SetDynamicRootExploration(double alpha_base,
+                                        double reference_actions) {
+  use_dynamic_dirichlet_ = true;
+  dirichlet_alpha_base_ = alpha_base;
+  dirichlet_alpha_reference_actions_ =
+      reference_actions <= 0 ? 1.0 : reference_actions;
+}
+
+void MCTSBot::ClearDynamicRootExploration() { use_dynamic_dirichlet_ = false; }
+
+void MCTSBot::SetRootPolicyTemperature(double temperature) {
+  root_policy_temperature_ = std::max(temperature, 1e-6);
+}
+
+void MCTSBot::SetForcedPlayoutConfig(double k, double gamma) {
+  forced_playouts_k_ = std::max(0.0, k);
+  forced_playouts_gamma_ = gamma;
+  use_forced_playouts_ = forced_playouts_k_ > 0;
+}
+
+void MCTSBot::SetPolicyTargetPruning(bool enable) {
+  policy_target_pruning_ = enable;
+}
+
 Action MCTSBot::Step(const State& state) {
   absl::Time start = absl::Now();
   std::unique_ptr<SearchNode> root = MCTSearch(state);
@@ -280,21 +305,61 @@ std::unique_ptr<State> MCTSBot::ApplyTreePolicy(
     if (current_node->children.empty()) {
       // For a new node, initialize its state, then choose a child as normal.
       ActionsAndProbs legal_actions = evaluator_->Prior(*working_state);
-      if (current_node == root && dirichlet_alpha_ > 0) {
-        std::vector<double> noise =
-            dirichlet_noise(legal_actions.size(), dirichlet_alpha_, &rng_);
-        for (int i = 0; i < legal_actions.size(); i++) {
-          legal_actions[i].second =
-              (1 - dirichlet_epsilon_) * legal_actions[i].second +
-              dirichlet_epsilon_ * noise[i];
+      const bool apply_root_noise =
+          (current_node == root) &&
+          (working_state->CurrentPlayer() != kChancePlayerId);
+      std::vector<double> noise_values;
+      double applied_epsilon = dirichlet_epsilon_;
+      if (apply_root_noise) {
+        double alpha = dirichlet_alpha_;
+        if (use_dynamic_dirichlet_) {
+          double action_count =
+              static_cast<double>(std::max<size_t>(1, legal_actions.size()));
+          alpha = dirichlet_alpha_base_ * dirichlet_alpha_reference_actions_ /
+                  action_count;
+          double scale = action_count / dirichlet_alpha_reference_actions_;
+          if (scale < 1.0) {
+            applied_epsilon *= scale;
+          }
+        }
+        if (legal_actions.size() <= 1) {
+          applied_epsilon = 0;
+        }
+        const bool need_noise =
+            (alpha > 0) && (applied_epsilon > 0 || use_forced_playouts_);
+        if (need_noise) {
+          noise_values = dirichlet_noise(legal_actions.size(), alpha, &rng_);
+        }
+        if (!noise_values.empty() && applied_epsilon > 0) {
+          for (int i = 0; i < legal_actions.size(); ++i) {
+            legal_actions[i].second =
+                (1 - applied_epsilon) * legal_actions[i].second +
+                applied_epsilon * noise_values[i];
+          }
         }
       }
-      // Reduce bias from move generation order.
-      std::shuffle(legal_actions.begin(), legal_actions.end(), rng_);
+      std::vector<int> order(legal_actions.size());
+      std::iota(order.begin(), order.end(), 0);
+      std::shuffle(order.begin(), order.end(), rng_);
+      ActionsAndProbs shuffled_actions;
+      shuffled_actions.reserve(legal_actions.size());
+      std::vector<double> shuffled_noise;
+      shuffled_noise.reserve(legal_actions.size());
+      for (int idx : order) {
+        shuffled_actions.push_back(legal_actions[idx]);
+        double noise =
+            (!noise_values.empty() && apply_root_noise) ? noise_values[idx] : 0.0;
+        shuffled_noise.push_back(noise);
+      }
+      legal_actions = std::move(shuffled_actions);
       Player player = working_state->CurrentPlayer();
       current_node->children.reserve(legal_actions.size());
-      for (auto [action, prior] : legal_actions) {
+      for (int i = 0; i < legal_actions.size(); ++i) {
+        auto [action, prior] = legal_actions[i];
         current_node->children.emplace_back(action, player, prior);
+        if (apply_root_noise) {
+          current_node->children.back().dirichlet_noise = shuffled_noise[i];
+        }
       }
       nodes_ += current_node->children.capacity();
     }
@@ -320,22 +385,45 @@ std::unique_ptr<State> MCTSBot::ApplyTreePolicy(
           }
         }
       } else {
-        // Otherwise choose node with largest UCT value.
-        double max_value = -std::numeric_limits<double>::infinity();
-        for (SearchNode& child : current_node->children) {
-          double val;
-          switch (child_selection_policy_) {
-            case ChildSelectionPolicy::UCT:
-              val = child.UCTValue(current_node->explore_count, uct_c_);
-              break;
-            case ChildSelectionPolicy::PUCT:
-              val = child.PUCTValue(current_node->explore_count, uct_c_);
-              break;
+        bool forced_choice = false;
+        if (current_node == root && use_forced_playouts_ &&
+            working_state->CurrentPlayer() != kChancePlayerId) {
+          double parent_total =
+              std::max(1.0, static_cast<double>(current_node->explore_count));
+          double forced_scale = std::pow(parent_total, forced_playouts_gamma_);
+          double best_deficit = 0.0;
+          for (SearchNode& child : current_node->children) {
+            double target = forced_playouts_k_ * child.dirichlet_noise * forced_scale;
+            double deficit = target - child.explore_count;
+            if (deficit > best_deficit + 1e-9) {
+              best_deficit = deficit;
+              chosen_child = &child;
+            }
           }
-          if (val > max_value) {
-            max_value = val;
-            chosen_child = &child;
+          if (chosen_child != nullptr) {
+            forced_choice = true;
           }
+        }
+        if (!forced_choice) {
+          // Otherwise choose node with largest UCT/PUCT value.
+          double max_value = -std::numeric_limits<double>::infinity();
+          for (SearchNode& child : current_node->children) {
+            double val;
+            switch (child_selection_policy_) {
+              case ChildSelectionPolicy::UCT:
+                val = child.UCTValue(current_node->explore_count, uct_c_);
+                break;
+              case ChildSelectionPolicy::PUCT:
+                val = child.PUCTValue(current_node->explore_count, uct_c_);
+                break;
+            }
+            if (val > max_value) {
+              max_value = val;
+              chosen_child = &child;
+            }
+          }
+        } else {
+          chosen_child->forced_playouts += 1;
         }
       }
       selected_action = chosen_child->action;
