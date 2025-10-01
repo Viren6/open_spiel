@@ -26,7 +26,8 @@ import pyspiel
 
 _FULLY_OPTIONAL_PYTHON_GAMES = frozenset([
     "python_pokerkit_wrapper",
-    "python_pokerkit_wrapper_acpc_style"
+    "python_pokerkit_wrapper_acpc_style",
+    "python_repeated_pokerkit"
 ])
 # Specify game names in alphabetical order, to make the test easier to read.
 # "Mandatory" = neither optional nor included only if certain flags are set.
@@ -135,6 +136,7 @@ EXPECTED_MANDATORY_GAMES = frozenset([
     "python_liars_poker",
     "quoridor",
     "repeated_game",
+    "repeated_leduc_poker",
     "rbc",
     "restricted_nash_response",
     "sheriff",
@@ -263,6 +265,10 @@ class PyspielTest(parameterized.TestCase):
     self.assertFalse(state.is_chance_node())
     self.assertFalse(state.is_terminal())
     self.assertEqual(state.legal_actions(), [0, 1, 2, 3, 4, 5, 6, 7, 8])
+
+  def test_game_string(self):
+    game = pyspiel.load_game("tic_tac_toe")
+    self.assertEqual(str(game), game.to_string())
 
   def test_game_parameters_from_string_empty(self):
     self.assertEqual(pyspiel.game_parameters_from_string(""), {})
